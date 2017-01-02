@@ -33,7 +33,7 @@ class Worker
      *
      * @var string
      */
-    const VERSION = '3.3.5';
+    const VERSION = '3.3.6';
 
     /**
      * Status starting.
@@ -76,7 +76,7 @@ class Worker
      *
      * @var int
      */
-    const DEFAULT_BACKLOG = 1024;
+    const DEFAULT_BACKLOG = 102400;
     /**
      * Max udp package size.
      *
@@ -190,7 +190,7 @@ class Worker
     public $onWorkerStop = null;
 
     /**
-     * Emitted when worker processes get reload command.
+     * Emitted when worker processes get reload signal.
      *
      * @var callback
      */
@@ -258,6 +258,20 @@ class Worker
      * @var Events\EventInterface
      */
     public static $globalEvent = null;
+
+    /**
+     * Emitted when the master process get reload signal.
+     *
+     * @var callback
+     */
+    public static $onMasterReload = null;
+
+    /**
+     * Emitted when the master process terminated.
+     *
+     * @var callback
+     */
+    public static $onMasterStop = null;
 
     /**
      * The PID of master process.
@@ -525,13 +539,37 @@ class Worker
     }
 
     /**
+     * Get all worker instances.
+     *
+     * @return array
+     */
+    public static function getAllWorkers()
+    {
+        return self::$_workers;
+    }
+
+    /**
+     * Get global event-loop instance.
+     *
+     * @return EventInterface
+     */
+    public static function getEventLoop()
+    {
+        return self::$globalEvent;
+    }
+
+    /**
      * Init idMap.
      * return void
      */
     protected static function initId()
     {
         foreach (self::$_workers as $worker_id => $worker) {
-            self::$_idMap[$worker_id] = array_fill(0, $worker->count, 0);
+            $new_id_map = array();
+            for($key = 0; $key < $worker->count; $key++) {
+                $new_id_map[$key] = isset(self::$_idMap[$worker_id][$key]) ? self::$_idMap[$worker_id][$key] : 0;
+            }
+            self::$_idMap[$worker_id] = $new_id_map;
         }
     }
 
@@ -813,6 +851,9 @@ class Worker
      */
     protected static function getEventLoopName()
     {
+        if (interface_exists('\React\EventLoop\LoopInterface')) {
+            return 'React';
+        }
         foreach (self::$_availableEventLoops as $name) {
             if (extension_loaded($name)) {
                 self::$_eventLoopName = $name;
@@ -856,6 +897,7 @@ class Worker
                 }
             }
 
+            $worker->count = $worker->count <= 0 ? 1 : $worker->count;
             while (count(self::$_pidMap[$worker->workerId]) < $worker->count) {
                 static::forkOneWorker($worker);
             }
@@ -870,9 +912,12 @@ class Worker
      */
     protected static function forkOneWorker($worker)
     {
-        $pid = pcntl_fork();
         // Get available worker id.
         $id = self::getId($worker->workerId, 0);
+        if ($id === false) {
+            return;
+        }
+        $pid = pcntl_fork();
         // For master process.
         if ($pid > 0) {
             self::$_pidMap[$worker->workerId][$pid] = $pid;
@@ -906,11 +951,7 @@ class Worker
      */
     protected static function getId($worker_id, $pid)
     {
-        $id = array_search($pid, self::$_idMap[$worker_id]);
-        if ($id === false) {
-            self::safeEcho("getId fail\n");
-        }
-        return $id;
+        return array_search($pid, self::$_idMap[$worker_id]);
     }
 
     /**
@@ -1046,6 +1087,9 @@ class Worker
         }
         @unlink(self::$pidFile);
         self::log("Workerman[" . basename(self::$_startFile) . "] has been stopped");
+        if (self::$onMasterStop) {
+            call_user_func(self::$onMasterStop);
+        }
         exit(0);
     }
 
@@ -1062,6 +1106,19 @@ class Worker
             if (self::$_status !== self::STATUS_RELOADING && self::$_status !== self::STATUS_SHUTDOWN) {
                 self::log("Workerman[" . basename(self::$_startFile) . "] reloading");
                 self::$_status = self::STATUS_RELOADING;
+                // Try to emit onMasterReload callback.
+                if (self::$onMasterReload) {
+                    try {
+                        call_user_func(self::$onMasterReload);
+                    } catch (\Exception $e) {
+                        self::log($e);
+                        exit(250);
+                    } catch (\Error $e) {
+                        self::log($e);
+                        exit(250);
+                    }
+                    self::initId();
+                }
             }
 
             // Send reload signal to all child processes.
@@ -1356,12 +1413,16 @@ class Worker
         list($scheme, $address) = explode(':', $this->_socketName, 2);
         // Check application layer protocol class.
         if (!isset(self::$_builtinTransports[$scheme])) {
-            $scheme         = ucfirst($scheme);
-            $this->protocol = '\\Protocols\\' . $scheme;
-            if (!class_exists($this->protocol)) {
-                $this->protocol = "\\Workerman\\Protocols\\$scheme";
+            if(class_exists($scheme)){
+                $this->protocol = $scheme;
+            } else {
+                $scheme         = ucfirst($scheme);
+                $this->protocol = '\\Protocols\\' . $scheme;
                 if (!class_exists($this->protocol)) {
-                    throw new Exception("class \\Protocols\\$scheme not exist");
+                    $this->protocol = "\\Workerman\\Protocols\\$scheme";
+                    if (!class_exists($this->protocol)) {
+                        throw new Exception("class \\Protocols\\$scheme not exist");
+                    }
                 }
             }
             $local_socket = $this->transport . ":" . $address;
@@ -1377,15 +1438,7 @@ class Worker
         if ($this->reusePort) {
             stream_context_set_option($this->_context, 'socket', 'so_reuseport', 1);
         }
-        if ($this->transport === 'unix') {
-            umask(0);
-            list(, $address) = explode(':', $this->_socketName, 2);
-            if (!is_file($address)) {
-                register_shutdown_function(function () use ($address) {
-                    @unlink($address);
-                });
-            }
-        }
+
         // Create an Internet or Unix domain server socket.
         $this->_mainSocket = stream_socket_server($local_socket, $errno, $errmsg, $flags, $this->_context);
         if (!$this->_mainSocket) {
